@@ -21,7 +21,7 @@ numba_logger.setLevel(logging.WARNING)
 
 # 로그 설정
 logging.basicConfig(
-    level=logging.INFO,  # 로그 레벨을 INFO로 설정
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
