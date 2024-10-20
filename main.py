@@ -29,20 +29,18 @@ warnings.filterwarnings("ignore", category=sc.SoundcardRuntimeWarning)
 
 # 설정 변수
 SAMPLE_RATE = 44100
-BUFFER_DURATION = 5  # 초 단위
+BUFFER_DURATION = 5
 BUFFER_SIZE = int(SAMPLE_RATE * BUFFER_DURATION)
 CHUNK_SIZE = 1024
-MAX_QUEUE_SIZE = 50  # 오디오 큐의 최대 크기
+MAX_QUEUE_SIZE = 50
 
-ARDUINO_PORT = 'COM6'  # 아두이노 포트 (자동으로 설정함)
-BAUD_RATE = 9600
+BAUD_RATE = 115200
 
-SILENCE_THRESHOLD = 0.01  # RMS 기준 침묵 임계값
+SILENCE_THRESHOLD = 0.01
 SILENCE_DURATION = 2
 
 # 아두이노 통신 관련 상수
-MIN_COMMAND_INTERVAL = 0.05  # 최소 명령 간격 (초)
-COMMAND_BUFFER_SIZE = 10     # 명령 버퍼 크기
+MIN_COMMAND_INTERVAL = 0.1
 
 # 기본 스피커 설정
 default_speaker = sc.default_speaker()
@@ -207,88 +205,94 @@ class ArduinoManager:
     def __init__(self, arduino):
         self.arduino = arduino
         self.last_command_time = 0
-        self.command_buffer = deque(maxlen=COMMAND_BUFFER_SIZE)
-        self.retry_limit = 3  # 재시도 횟수 설정
+        self.last_command = None  # 마지막으로 보낸 명령 저장
+        self.command_interval = MIN_COMMAND_INTERVAL  # 명령 전송 간격 (초)
 
     def send_command(self, command):
         current_time = time.time()
-        if current_time - self.last_command_time < MIN_COMMAND_INTERVAL:
-            self.command_buffer.append(command)
-        else:
-            self._send_command_to_arduino_with_retry(command)
+        if command == self.last_command:
+            return  # 동일한 명령은 무시
+        if current_time - self.last_command_time >= self.command_interval:
+            self._send_command_to_arduino(command)
             self.last_command_time = current_time
+            self.last_command = command
 
-    def process_buffer(self):
-        current_time = time.time()
-        if self.command_buffer and current_time - self.last_command_time >= MIN_COMMAND_INTERVAL:
-            command = self.command_buffer.popleft()
-            self._send_command_to_arduino_with_retry(command)
-            self.last_command_time = current_time
+    def _send_command_to_arduino(self, command):
+        try:
+            if self.arduino and self.arduino.is_open:
+                self.arduino.write(command.encode())
+        except serial.SerialTimeoutException as e:
+            logging.error(f"Write timeout 발생: {str(e)}")
+            traceback.print_exc()
+        except serial.SerialException as e:
+            logging.error(f"시리얼 통신 오류: {str(e)}")
+            traceback.print_exc()
 
-    def _send_command_to_arduino_with_retry(self, command):
-        for attempt in range(self.retry_limit):
-            try:
-                if self.arduino and self.arduino.is_open:
-                    self.arduino.write(command.encode())
-                    return  # 성공 시 종료
-            except serial.SerialTimeoutException as e:
-                logging.error(f"Arduino write timeout (시도 {attempt + 1}/{self.retry_limit}): {str(e)}")
-                time.sleep(0.5)
-            except serial.SerialException as e:
-                logging.error(f"Arduino 통신 오류: {str(e)}")
-                break  # 다른 시리얼 오류 발생 시 중단
-        logging.error("Arduino로 명령 전송 실패: 최대 재시도 횟수 초과")
+# 조명 제어 스레드 클래스
+class LightController(Thread):
+    def __init__(self, arduino_manager):
+        super().__init__()
+        self.arduino_manager = arduino_manager
+        self.bpm = None
+        self.last_beat_time = time.time()
+        self.running = True
+        self.is_silent = False
+        self.lock = Lock()
+        self.light_on = False
 
-# 조명 상태 변수
-light_on = False
-light_lock = Lock()
+    def update_bpm(self, bpm):
+        with self.lock:
+            self.bpm = bpm
 
-def control_lights(bpm, last_beat_time, arduino_manager, is_silent=False):
-    global light_on
-    current_time = time.time()
-    try:
-        with light_lock:
-            if is_silent:
-                if light_on:
-                    if arduino_manager:
-                        arduino_manager.send_command('0\n')
-                    print("\r💡 소리가 감지되지 않아 조명이 꺼졌습니다.", end='', flush=True)
-                    light_on = False
-                return current_time, False
+    def set_silent(self, is_silent):
+        with self.lock:
+            self.is_silent = is_silent
 
-            if bpm is None:
-                if light_on:
-                    if arduino_manager:
-                        arduino_manager.send_command('0\n')
-                    print("\r💡 BPM을 측정할 수 없어 조명이 꺼졌습니다.", end='', flush=True)
-                    light_on = False
-                return current_time, False
+    def run(self):
+        while self.running:
+            with self.lock:
+                bpm = self.bpm
+                is_silent = self.is_silent
 
-            # 비트 간격 계산
+            current_time = time.time()
+
+            if is_silent or bpm is None:
+                if self.light_on:
+                    if self.arduino_manager:
+                        self.arduino_manager.send_command('0\n')
+                    self.light_on = False
+                time.sleep(0.1)
+                continue
+
             beat_interval = 60.0 / bpm
-            time_since_last_beat = current_time - last_beat_time
+            time_since_last_beat = current_time - self.last_beat_time
 
             if time_since_last_beat >= beat_interval:
-                if not light_on:
-                    if arduino_manager:
-                        arduino_manager.send_command('1\n')
+                # 조명 켜기
+                if not self.light_on:
+                    if self.arduino_manager:
+                        self.arduino_manager.send_command('1\n')
+                    self.light_on = True
                     print(f"\r💡 ON (BPM: {bpm:.2f})", end='', flush=True)
-                    light_on = True
 
-                time.sleep(min(0.1, beat_interval / 2))
-                if light_on:
-                    if arduino_manager:
-                        arduino_manager.send_command('0\n')
+                # 일정 시간 후 조명 끄기
+                off_duration = min(0.1, beat_interval / 2)
+                time.sleep(off_duration)
+
+                if self.light_on:
+                    if self.arduino_manager:
+                        self.arduino_manager.send_command('0\n')
+                    self.light_on = False
                     print(f"\r💡 OFF (BPM: {bpm:.2f})", end='', flush=True)
-                    light_on = False
 
-                return current_time, True
+                self.last_beat_time = current_time
+            else:
+                # 다음 비트까지 대기
+                sleep_time = beat_interval - time_since_last_beat
+                time.sleep(min(sleep_time, 0.1))
 
-            return last_beat_time, False
-    except Exception:
-        logging.error("control_lights 함수에서 오류 발생:")
-        traceback.print_exc()
-    return last_beat_time, False
+    def stop(self):
+        self.running = False
 
 def find_arduino_port():
     try:
@@ -350,7 +354,7 @@ bpm_queue = Queue()
 # 공유 변수와 잠금 객체 초기화
 sound_detected = False
 sound_lock = Lock()
-rms_history = deque(maxlen=5)  # RMS 값의 이동 평균 계산을 위한 큐
+rms_history = deque(maxlen=5)
 
 def audio_capture():
     global sound_detected
@@ -440,12 +444,16 @@ def main():
         print(f"'{default_speaker.name}'에서 출력되는 소리를 실시간으로 분석하여 BPM을 계산합니다.")
         logging.info(f"'{default_speaker.name}'에서 출력되는 소리를 실시간으로 분석하여 BPM을 계산합니다.")
 
-        last_beat_time = time.time()
         last_sound_time = time.time()
         current_bpm = None
         bpm_history = deque(maxlen=10)
         silence_start_time = None
         last_gc_time = time.time()
+
+        # 조명 제어 스레드 시작
+        light_controller = LightController(arduino_manager)
+        light_controller.daemon = True
+        light_controller.start()
 
         while True:
             try:
@@ -484,15 +492,11 @@ def main():
                         logging.error("BPM 큐 처리 중 오류 발생:")
                         traceback.print_exc()
 
-                if current_bpm is not None and not is_silent:
-                    with arduino_lock:
-                        last_beat_time, _ = control_lights(current_bpm, last_beat_time, arduino_manager, is_silent)
-                else:
-                    with arduino_lock:
-                        last_beat_time, _ = control_lights(None, last_beat_time, arduino_manager, is_silent)
+                # 조명 제어 스레드에 현재 BPM과 침묵 상태 업데이트
+                light_controller.update_bpm(current_bpm)
+                light_controller.set_silent(is_silent)
 
-                if arduino_manager:
-                    arduino_manager.process_buffer()
+                # arduino_manager.process_buffer() 호출 제거
 
                 time.sleep(0.01)
             except Exception as e:
@@ -508,6 +512,8 @@ def main():
         traceback.print_exc()
     finally:
         try:
+            light_controller.stop()
+            light_controller.join()
             with arduino_lock:
                 if arduino and arduino.is_open:
                     if arduino_manager:
