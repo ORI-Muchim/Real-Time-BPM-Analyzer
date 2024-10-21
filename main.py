@@ -37,26 +37,12 @@ print(f"마이크 설정 완료: {mic.name}")
 
 # BPM 분석 함수들
 def compute_onset_envelope(data, sr):
-    frame_size = 512
-    hop_length = 128
-    num_frames = (len(data) - frame_size) // hop_length + 1
-    frames = np.lib.stride_tricks.as_strided(
-        data,
-        shape=(num_frames, frame_size),
-        strides=(data.strides[0]*hop_length, data.strides[0])
-    )
-    window = np.hanning(frame_size)
-    stft = np.abs(np.fft.rfft(frames * window[None, :], axis=1))
-    spectral_flux = np.diff(stft, axis=0)
-    spectral_flux = np.maximum(spectral_flux, 0)
-    onset_envelope = np.sum(spectral_flux, axis=1)
-    onset_envelope = scipy.signal.medfilt(onset_envelope, kernel_size=3)
-    onset_envelope /= np.max(onset_envelope) + 1e-6
-    return onset_envelope, hop_length
+    # librosa의 onset_strength 함수를 사용하여 효율적으로 계산
+    onset_env = librosa.onset.onset_strength(y=data, sr=sr)
+    return onset_env
 
-def autocorrelation_bpm(data, sr):
+def autocorrelation_bpm(onset_env, sr, hop_length):
     try:
-        onset_env, hop_length = compute_onset_envelope(data, sr)
         corr = correlate(onset_env, onset_env, mode='full')
         corr = corr[len(corr)//2:]
         bpm_min, bpm_max = 60, 300
@@ -78,58 +64,16 @@ def autocorrelation_bpm(data, sr):
         traceback.print_exc()
     return None
 
-def fft_based_bpm_detector(data, sr):
-    try:
-        onset_env, hop_length = compute_onset_envelope(data, sr)
-        fft_vals = np.abs(np.fft.rfft(onset_env))
-        freqs = np.fft.rfftfreq(len(onset_env), d=hop_length / sr)
-        min_bpm = 60
-        max_bpm = 300
-        min_freq = min_bpm / 60
-        max_freq = max_bpm / 60
-        mask = (freqs >= min_freq) & (freqs <= max_freq)
-        fft_filtered = fft_vals[mask]
-        freqs_filtered = freqs[mask]
-        if len(fft_filtered) == 0:
-            return None
-        peak_index = np.argmax(fft_filtered)
-        peak_freq = freqs_filtered[peak_index]
-        bpm = peak_freq * 60
-        return float(bpm)
-    except Exception as e:
-        print("fft_based_bpm_detector 함수에서 오류 발생:", e)
-        traceback.print_exc()
-    return None
-
-def librosa_bpm_detector(data, sr):
-    try:
-        tempo, _ = librosa.beat.beat_track(y=data, sr=sr, start_bpm=150, tightness=100)
-        return float(tempo)
-    except Exception as e:
-        print("librosa_bpm_detector 함수에서 오류 발생:", e)
-        traceback.print_exc()
-    return None
-
 def combined_bpm_detector(data, sr):
     rms = np.sqrt(np.mean(data**2))
     if rms < SILENCE_THRESHOLD:
         return None
-    
-    bpm_estimates = []
+
     try:
-        librosa_bpm = librosa_bpm_detector(data, sr)
-        if librosa_bpm:
-            bpm_estimates.append(librosa_bpm)
-        autocorr_bpm = autocorrelation_bpm(data, sr)
-        if autocorr_bpm:
-            bpm_estimates.append(autocorr_bpm)
-        fft_bpm = fft_based_bpm_detector(data, sr)
-        if fft_bpm:
-            bpm_estimates.append(fft_bpm)
-        bpm_estimates = [bpm for bpm in bpm_estimates if bpm is not None]
-        if not bpm_estimates:
-            return None
-        return float(np.median(bpm_estimates))
+        onset_env = compute_onset_envelope(data, sr)
+        hop_length = 512  # librosa의 onset_strength 기본 hop_length
+        bpm = autocorrelation_bpm(onset_env, sr, hop_length)
+        return bpm
     except Exception as e:
         print("combined_bpm_detector 함수에서 오류 발생:", e)
         traceback.print_exc()
@@ -350,10 +294,8 @@ def bpm_analysis(audio_queue, bpm_queue):
             if len(audio_buffer) >= BUFFER_SIZE and current_time - last_analysis_time > 1:
                 data = np.array(audio_buffer)
 
-                # **여기서 입력 데이터의 RMS 값을 계산하여 무음 여부를 판단합니다.**
                 rms = np.sqrt(np.mean(data**2))
                 if rms < SILENCE_THRESHOLD:
-                    # 무음인 경우 BPM 분석을 건너뜁니다.
                     bpm = None
                 else:
                     bpm = combined_bpm_detector(data, SAMPLE_RATE)
@@ -369,14 +311,14 @@ def bpm_analysis(audio_queue, bpm_queue):
             traceback.print_exc()
             time.sleep(1)
 
-def monitor_arduino(arduino_lock, arduino, arduino_manager):
+def monitor_arduino(arduino_lock, arduino_manager):
     while True:
         try:
             with arduino_lock:
-                if arduino is None or not arduino.is_open:
+                if arduino_manager.arduino is None or not arduino_manager.arduino.is_open:
                     print("아두이노가 연결되어 있지 않습니다. 재연결을 시도합니다.")
-                    arduino = reconnect_arduino(arduino)
-                    arduino_manager = ArduinoManager(arduino) if arduino else None
+                    arduino = reconnect_arduino(arduino_manager.arduino)
+                    arduino_manager.arduino = arduino
         except Exception as e:
             print("아두이노 모니터링 중 오류 발생:", e)
             traceback.print_exc()
@@ -400,7 +342,7 @@ def main():
     bpm_thread.daemon = True
     bpm_thread.start()
 
-    arduino_monitor_thread = Thread(target=monitor_arduino, args=(arduino_lock, arduino, arduino_manager))
+    arduino_monitor_thread = Thread(target=monitor_arduino, args=(arduino_lock, arduino_manager))
     arduino_monitor_thread.daemon = True
     arduino_monitor_thread.start()
 
